@@ -70,7 +70,10 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
 
     
     def forward_registration(self, initial_img, target_img, target_age, ages, grid):
+        shape = initial_img.shape[2:]
+        scale_factor = torch.tensor(shape).to(self.device).view(1, 3, 1, 1, 1) * 1.
         all_phi, loss_reg = self.registration(initial_img, target_img, ages, target_age, grid)
+        all_phi = (all_phi + 1.) / 2. * scale_factor
         return all_phi, loss_reg
     
     def _training_segmentation_step(self, batch, batch_idx):
@@ -82,6 +85,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         shape = images.shape[2:]
         scale_factor = torch.tensor(shape).to(self.device).view(1, 3, 1, 1, 1) * 1.
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
+        grid_voxel = (grid + 1.) / 2. * scale_factor
 
         for i in range(images.shape[0]):
             # Compute segmentation loss for image I against all other segmentations in the sequence registered to I
@@ -93,11 +97,18 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
                 # Get deformation from k to i
                 initial_img = images[i:i + 1].float()
                 target_img = images[k:k + 1].float()
-                agesIK = torch.Tensor([ages[i], ages[k]]).to(self.device)
+
+                agesIK = torch.tensor([ages[i], ages[k]]).to(self.device)
+                if k < i:
+                    target_img = images[0:1].float()
+                    target_age = ages[0]
+                else:
+                    target_img = images[-1:].float()
+                    target_age = ages[-1]
+
                 with torch.no_grad():
-                    all_phi, _ = self.forward_registration(initial_img, target_img, ages[k], agesIK, grid)
+                    all_phi, _ = self.forward_registration(initial_img, target_img, target_age, agesIK, grid)
                 all_phi = all_phi.detach()
-                grid_voxel = (grid + 1.) / 2. * scale_factor
                 df = all_phi[-1] - grid_voxel
                 warped_seg = registration.warp(seg_i_pred, df)
                 # Get segmentation of image k and warp it to i
@@ -114,98 +125,138 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
     
 
     def _training_registration_step(self, batch, batch_idx):
+        """Compute total weighted loss, back-propagate, and log per-term metrics."""
+        optimizer, _ = self.optimizers()
+
         images, _, ages = batch
-        optimizer, _ = self.optimizers() # type: ignore
-        images = images.squeeze(0)
-        ages = ages.squeeze(0).to(self.device)
-        shape = images.shape[2:]
+        shape = images[0].shape[2:]
         scale_factor = torch.tensor(shape).to(self.device).view(1, 3, 1, 1, 1) * 1.
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
-        # Initialise losses to zero
-        segs = []
-        with torch.no_grad():
-            for i in range(images.shape[0]):
-                seg_i_pred = self.segmentation(images[i:i + 1].float())
-                segs.append(torch.argmax(seg_i_pred, dim=1).float().to(self.device))
 
+        images = images.squeeze(0)
+        ages = ages.squeeze(0).to(self.device)
+        segs  = []
         for i in range(images.shape[0]):
+            segs.append(torch.argmax(self.segmentation(images[i:i + 1].float()), dim=1).cpu()) 
+        segs = torch.stack(segs, dim=0).detach().to(self.device) # (T, C, X, Y, Z)
+
+
+        all_i = list(range(0, images.shape[0]-1))
+        random.shuffle(all_i) # Randomize order of pairs to avoid biasing towards early or late
+
+        for i in all_i:
+            # Subset of the sequence starting from i in the forward direction 
+            subset_images = images[i:]
+            subset_ages = ages[i:]
+            subset_segs = segs[i:]
+
             loss_sim = torch.tensor(0.0, device=self.device)
             loss_seg = torch.tensor(0.0, device=self.device)
-            loss_reg_tot = torch.tensor(0.0, device=self.device)
             loss_jac = torch.tensor(0.0, device=self.device)
-            img_i = images[i:i + 1].float()
-            seg_i_pred = F.one_hot(segs[i].long(), num_classes=-1).permute(0, 4, 1, 2, 3).float()
+
+    
+            initial_img = subset_images[0:1].float()
+            target_img = subset_images[-1:].float()
+            initial_seg = F.one_hot(subset_segs[0].cpu().long(), num_classes=-1).permute(0, 4, 1, 2, 3)
+            all_phi, loss_reg = self.forward_registration(initial_img, target_img, subset_ages[-1], subset_ages, grid)
+            
             grid_voxel = (grid + 1.) / 2. * scale_factor
-            # Forward registration from i to all other time points k, compute losses for each pair (i,k) and accumulate
-            if ages[i:].shape[0] > 1:
-                subset_imgs = images[i:]
-                subset_ages = ages[i:]
-                subset_segs = segs[i:]
-                all_phi, loss_reg = self.forward_registration(img_i, subset_imgs[-1], subset_ages[-1], subset_ages, grid)
-                loss_reg_tot += loss_reg
-                all_phi = (all_phi + 1.) / 2. * scale_factor
-                for t in range(1, subset_imgs.shape[0]):
-                    df = all_phi[t] - grid_voxel
-                    if self.lambda_sim > 0:
-                        warped = registration.warp(img_i, df)
-                        loss_sim += self.loss_sim(warped, subset_imgs[t])
-                        del warped
 
-                    if self.lambda_seg > 0:
-                        warped_seg = registration.warp(seg_i_pred.float().to(self.device), df)
-                        seg_t_pred = F.one_hot(subset_segs[t].long(), num_classes=-1).permute(0, 4, 1, 2, 3).float().to(self.device)
-                        loss_seg += self.loss_seg(warped_seg, seg_t_pred)
-                        del warped_seg, seg_t_pred
-                    if self.lambda_jac > 0:
-                        loss_jac += self.loss_jac(df)
-                    del df
-            # Backward registration from i to all other time points k, compute losses for each pair (i,k) and accumulate
-            if ages[:i + 1].shape[0] > 1:
-                    subset_imgs = images[:i + 1]
-                    subset_imgs = torch.flip(subset_imgs, dims=[0])
-                    subset_ages = ages[:i + 1]
-                    subset_ages = torch.flip(subset_ages, dims=[0])
-                    subset_segs = segs[:i + 1]
-                    subset_segs.reverse()
-                    all_phi, loss_reg = self.forward_registration(img_i, subset_imgs[-1], subset_ages[-1], subset_ages, grid)
-                    loss_reg_tot += loss_reg
-                    all_phi = (all_phi + 1.) / 2. * scale_factor
-                    for t in range(1, subset_imgs.shape[0]):
-                        df = all_phi[t] - grid_voxel
-                        if self.lambda_sim > 0:
-                            warped = registration.warp(img_i, df)
-                            loss_sim += self.loss_sim(warped, subset_imgs[t])
-                            del warped
+            for idx in range(1, subset_images.shape[0]):
+                phi = all_phi[idx]
+                df = phi - grid_voxel
+                if self.lambda_sim > 0:
+                    warped = registration.warp(initial_img, df)
+                    loss_sim += self.loss_sim(warped, images[idx:idx + 1].float())
+                    del warped
+                if self.lambda_seg > 0:
+                    warped_seg = registration.warp(initial_seg.float().to(self.device), df)
+                    loss_seg += self.loss_seg(warped_seg, F.one_hot(subset_segs[idx].cpu().long(), num_classes=-1).permute(0, 4, 1, 2, 3).float().to(self.device))
+                    del warped_seg
+                if self.lambda_jac > 0:
+                    loss_jac += self.loss_jac(df)
+                del phi, df
 
-                        if self.lambda_seg > 0:
-                            warped_seg = registration.warp(seg_i_pred.float().to(self.device), df)
-                            seg_t_pred = F.one_hot(subset_segs[t].long(), num_classes=-1).permute(0, 4, 1, 2, 3).float().to(self.device)
-                            loss_seg += self.loss_seg(warped_seg, seg_t_pred)
-                            del warped_seg, seg_t_pred
-                        if self.lambda_jac > 0:
-                            loss_jac += self.loss_jac(df)
-                        del df
-                    del all_phi, grid_voxel
-                    torch.cuda.empty_cache()
-            nb_element = images.shape[0] - 1
-            loss_seg = loss_seg / nb_element
-            loss_sim = loss_sim / nb_element
-            loss_jac = loss_jac / nb_element
-            loss_reg = loss_reg / ((ages[-1] - ages[0]) / self.registration.step_time) # Normalize by number of integration steps, not number of images
+            num_steps = subset_images.shape[0] - 1
+            loss_seg = loss_seg / num_steps
+            loss_sim = loss_sim / num_steps
+            loss_jac = loss_jac / num_steps
 
-            loss =  self.lambda_sim * loss_sim + self.lambda_seg * loss_seg  + self.lambda_reg * loss_reg + self.lambda_jac * loss_jac 
-            optimizer.zero_grad()
+            loss_reg = loss_reg / torch.abs(((subset_ages[-1] - subset_ages[0]) / self.registration.step_time)) # Normalize by number of integration steps, not number of images
+            loss =  self.lambda_sim * loss_sim + self.lambda_seg * loss_seg  + self.lambda_reg * loss_reg + self.lambda_jac * loss_jac
+            optimizer.zero_grad() # type: ignore
             self.manual_backward(loss)
-            optimizer.step()
+            optimizer.step() # type: ignore
+
             self.log_dict({
-                'Registration/loss': loss.item(),
-                'Registration/loss_sim': (self.lambda_sim * loss_sim).item(),
-                'Registration/loss_seg': (self.lambda_seg * loss_seg).item(),
-                'Registration/loss_jac': (self.lambda_jac * loss_jac).item()
+                'loss_G': loss.item(),
+                'Registration_Forward/loss_sim': (self.lambda_sim * loss_sim).item(),
+                'Registration_Forward/loss_seg': (self.lambda_seg * loss_seg).item(),
+                'Registration_Forward/loss_reg': (self.lambda_reg * loss_reg).item(),
+                'Registration_Forward/loss_jac': (self.lambda_jac * loss_jac).item()
             }, on_step=False, on_epoch=True, prog_bar=True)
-            del loss, loss_sim, loss_reg
-        # ── always flush at end of step ──
-        torch.cuda.empty_cache()
+
+            subset_images = torch.flip(images, dims=[0])
+            subset_ages = torch.flip(ages, dims=[0])
+            subset_segs = torch.flip(segs, dims=[0])
+
+            subset_images = images[i:]
+            subset_ages = ages[i:]
+            subset_segs = segs[i:]
+
+
+            loss_sim = torch.tensor(0.0, device=self.device)
+            loss_seg = torch.tensor(0.0, device=self.device)
+            loss_jac = torch.tensor(0.0, device=self.device)
+
+    
+            initial_img = subset_images[0:1].float()
+            target_img = subset_images[-1:].float()
+            initial_seg = F.one_hot(subset_segs[0].cpu().long(), num_classes=-1).permute(0, 4, 1, 2, 3)
+            all_phi, loss_reg = self.forward_registration(initial_img, target_img, subset_ages[-1], subset_ages, grid)
+            
+            grid_voxel = (grid + 1.) / 2. * scale_factor
+
+            for idx in range(1, subset_images.shape[0]):
+                phi = all_phi[idx]
+                df = phi - grid_voxel
+                if self.lambda_sim > 0:
+                    warped = registration.warp(initial_img, df)
+                    loss_sim += self.loss_sim(warped, images[idx:idx + 1].float())
+                    del warped
+                if self.lambda_seg > 0:
+                    warped_seg = registration.warp(initial_seg.float().to(self.device), df)
+                    loss_seg += self.loss_seg(warped_seg, F.one_hot(subset_segs[idx].cpu().long(), num_classes=-1).permute(0, 4, 1, 2, 3).float().to(self.device))
+                    del warped_seg
+                if self.lambda_jac > 0:
+                    loss_jac += self.loss_jac(df)
+                del phi, df
+
+            num_steps = subset_images.shape[0] - 1
+            loss_seg = loss_seg / num_steps
+            loss_sim = loss_sim / num_steps
+            loss_jac = loss_jac / num_steps
+
+            loss_reg = loss_reg / torch.abs(((subset_ages[-1] - subset_ages[0]) / self.registration.step_time)) # Normalize by number of integration steps, not number of images
+            loss =  self.lambda_sim * loss_sim + self.lambda_seg * loss_seg  + self.lambda_reg * loss_reg + self.lambda_jac * loss_jac
+            optimizer.zero_grad() # type: ignore
+            self.manual_backward(loss)
+            optimizer.step() # type: ignore
+
+            self.log_dict({
+                'loss_G': loss.item(),
+                'Registration_Backward/loss_sim': (self.lambda_sim * loss_sim).item(),
+                'Registration_Backward/loss_seg': (self.lambda_seg * loss_seg).item(),
+                'Registration_Backward/loss_reg': (self.lambda_reg * loss_reg).item(),
+                'Registration_Backward/loss_jac': (self.lambda_jac * loss_jac).item()
+            }, on_step=False, on_epoch=True, prog_bar=True)
+
+
+            # ── critical: free the ODE trajectory ──
+            del all_phi, grid_voxel, loss, loss_sim, loss_reg
+            # ── always flush at end of step ──
+            torch.cuda.empty_cache()
+
 
 
     def training_step(self, batch, batch_idx):
@@ -245,7 +296,6 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         with torch.no_grad():
             all_phi, _ = self.forward_registration(initial_img, target_img, ages[-1], ages, grid)
         all_phi = all_phi.detach()
-        all_phi = (all_phi + 1.) / 2. * scale_factor
         grid_voxel = (grid + 1.) / 2. * scale_factor
         all_registered = []
         all_targets = []

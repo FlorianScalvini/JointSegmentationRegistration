@@ -246,7 +246,7 @@ class VelocityNet(nn.Module):
         self.t_dim_enc = t_dim_enc
         self.t_dim = t_dim
         self.encoder = EncoderUnet(
-            in_channels=2, channels=[16, 32, 64, 128, 256], t_dim=self.t_dim
+            in_channels=3, channels=[16, 32, 64, 128, 256], t_dim=self.t_dim
         )
         self.decoder_0 = UnetUpBlock(
             in_channels=256, out_channels=128, kernel_size=3, t_dim=self.t_dim
@@ -264,7 +264,7 @@ class VelocityNet(nn.Module):
             self.t_dim_enc, max_periods=100
         )
         self.time_mlp = nn.Sequential(
-            nn.Linear(self.t_dim_enc * 2, self.t_dim, bias=True),
+            nn.Linear(self.t_dim_enc * 3, self.t_dim, bias=True),
             nn.SiLU(),
             nn.Linear(self.t_dim, self.t_dim, bias=True),
             nn.SiLU(),
@@ -318,7 +318,7 @@ class VelocityNet(nn.Module):
         with torch.no_grad():
             df = phi_t - self.grid
             warped = registration.warp(image_A, df)
-            net_input = torch.cat([image_A, warped], dim=1)
+            net_input = torch.cat([image_A, warped, image_B], dim=1)
             B: int = phi_t.shape[0]
 
         if t.dim() == 0:
@@ -328,10 +328,10 @@ class VelocityNet(nn.Module):
         if ageB.dim() == 0:
             ageB = ageB.expand(B)
 
-        t_enc: torch.Tensor = self.temp_enc(t)
+        t_enc: torch.Tensor = self.temp_enc((t - ageA) / (ageB - ageA + 1e-5))
         ageA_enc: torch.Tensor = self.temp_enc(ageA)
-        #ageB_enc: torch.Tensor = self.temp_enc(ageB)
-        t_all: torch.Tensor = torch.cat([ageA_enc, t_enc], dim=1)
+        ageB_enc: torch.Tensor = self.temp_enc(ageB)
+        t_all: torch.Tensor = torch.cat([ageA_enc, t_enc, ageB_enc], dim=1)
         t_all = self.time_mlp(t_all)
 
         feat_maps = self.encoder(net_input, t_all)
