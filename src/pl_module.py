@@ -200,9 +200,9 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
             subset_ages = torch.flip(ages, dims=[0])
             subset_segs = torch.flip(segs, dims=[0])
 
-            subset_images = images[i:]
-            subset_ages = ages[i:]
-            subset_segs = segs[i:]
+            subset_images = subset_images[i:]
+            subset_ages = subset_ages[i:]
+            subset_segs = subset_segs[i:]
 
 
             loss_sim = torch.tensor(0.0, device=self.device)
