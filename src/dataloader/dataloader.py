@@ -170,7 +170,7 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
 
             for j in range(len(subject)):
                 subject[j][2] = (subject[j][2] - t0) / (tn - t0)
-            subject.sort(key=lambda x: x[2])
+
             self.data_train.append(subject)
 
         with open(self.json_path_val, 'r') as f:
@@ -188,12 +188,11 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
 
             for j in range(len(subject)):
                 subject[j][2] = (subject[j][2] - t0) / (tn - t0)
-            subject.sort(key=lambda x: x[2])
             self.data_val.append(subject)
 
     def train_dataloader(self) -> torch.utils.data.DataLoader:
         """Return a shuffled DataLoader over the training subjects."""
-        dataset = SpatioTemporalDataset(self.data_train, self.transform, self.transform_seg)
+        dataset = SpatioTemporalDataset(self.data_train, self.transform)
         return torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=1,

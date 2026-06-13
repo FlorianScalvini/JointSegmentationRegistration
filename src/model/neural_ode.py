@@ -201,7 +201,8 @@ class ODEFunction(nn.Module):
         phi_t = state[0]
         v = self.vnet(t, phi_t, self.imageA, self.imageB, self.ageA, self.ageB)
         loss_v: torch.Tensor = self.loss(v)
-        return v, loss_v
+        direction = torch.sign(self.ageB - self.ageA)
+        return v, loss_v * direction
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -328,7 +329,7 @@ class VelocityNet(nn.Module):
         if ageB.dim() == 0:
             ageB = ageB.expand(B)
 
-        t_enc: torch.Tensor = self.temp_enc((t - ageA) / (ageB - ageA + 1e-5))
+        t_enc: torch.Tensor = self.temp_enc((t - ageA) / (ageB - ageA))
         ageA_enc: torch.Tensor = self.temp_enc(ageA)
         ageB_enc: torch.Tensor = self.temp_enc(ageB)
         t_all: torch.Tensor = torch.cat([ageA_enc, t_enc, ageB_enc], dim=1)

@@ -56,12 +56,10 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
         self,
         data: list,
         transform: transforms.Transform | None = None,
-        transform_seg: transforms.Transform | None = None,
         augmentation: bool = False,
     ) -> None:
         super().__init__()
         self.transform = transform
-        self.transform_seg = transform_seg
         self.augmentation = augmentation
         self.data: list = []
         for i in range(len(data)):
@@ -74,7 +72,7 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
 
     def __getitem__(
         self, idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return all sessions for subject *idx* sorted by age.
 
         Parameters
@@ -92,33 +90,24 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
             Acquisition ages of shape ``(T,)``.
         """
         mri_stack = []
-        seg_stack = []
         time_stack = []
         data = self.data[idx]
         for i in range(len(data)):
             session = tio.Subject(
                 image=tio.ScalarImage(data[i][0]),
-                label=tio.LabelMap(data[i][1]) if data[i][1] is not None else None,
-                sdf=tio.ScalarImage(data[i][1].replace("tissue", "sdf_cortex"))
             )
             if self.transform is not None:
                 session.image = self.transform(session.image) # type: ignore
 
-            if self.transform_seg is not None:
-                session.label = self.transform_seg(session.label) # type: ignore
-
             mri_stack.append(session.image.data)
-            if session.label is not None:
-                seg_stack.append(session.label.data)
             time_stack.append(data[i][2])
             del session
 
         # ── 5. stack ──────────────────────────────────────────────────
         mri_stack_out = torch.stack(mri_stack, dim=0)  # (T_total, 1, X, Y, Z)
-        seg_stack_out = torch.stack(seg_stack, dim=0)  # (T_total, 1, X, Y, Z)
         time_stack_out = torch.tensor(time_stack, dtype=torch.float)  # (T_total,)
 
-        return mri_stack_out, seg_stack_out, time_stack_out
+        return mri_stack_out, time_stack_out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
