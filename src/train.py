@@ -249,7 +249,12 @@ def main(args: Namespace) -> None:
     os.makedirs(save_dir, exist_ok=True)
 
     # --- Logger ---
-    tensorboard_logger: TensorBoardLogger = TensorBoardLogger(save_dir=save_dir)
+    tensorboard_logger: TensorBoardLogger = TensorBoardLogger(
+        save_dir=save_dir,
+        name="tensorboard",
+        version=0,
+        default_hp_metric=False,
+    )
 
     # --- Data module ---
     # The pretraining database supplies random labeled anchor samples, while
@@ -268,8 +273,6 @@ def main(args: Namespace) -> None:
         json_path_val=sequence_json,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        size=config["rsize"],
-        crop=config["csize"],
         t0=config["t0"],
         tn=config["tn"],
     )

@@ -7,10 +7,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --hint=nomultithread
-#SBATCH --time=10:00:00
+#SBATCH --time=100:00:00
 #SBATCH --output=./output/joint_seg_%A_%a.out
 #SBATCH --error=./error/joint_seg_%A_%a.err
-#SBATCH --qos=qos_gpu_h100-t3
+#SBATCH --qos=qos_gpu_h100-t4
 #SBATCH --array=0-0
 
 set -euo pipefail
@@ -22,9 +22,9 @@ module load pytorch-gpu
 PROJECT_DIR=/lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/JointSegmentationRegistration
 cd "$PROJECT_DIR"
 
-lambda_reg_values=(5)
+lambda_reg_values=(1)
 lambda_reg=${lambda_reg_values[$SLURM_ARRAY_TASK_ID]}
-lambda_jac_values=(10)
+lambda_jac_values=(20)
 lambda_jac=${lambda_jac_values[$SLURM_ARRAY_TASK_ID]}
 pretrain_registration_epochs=400
 segmentation_method=temporal_neighbors
@@ -33,7 +33,6 @@ set -x
 srun python -u src/train.py \
     --dataset "$PROJECT_DIR/data/babofet.yaml" \
     --segmentation_checkpoint "$PROJECT_DIR/last_segmentation_new.pt" \
-    --registration_checkpoint "$PROJECT_DIR/last_registration.pt" \
     --lambda_reg "$lambda_reg" \
     --lambda_jac "$lambda_jac" \
     --lambda_seg 1 \

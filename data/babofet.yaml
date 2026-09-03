@@ -1,0 +1,14 @@
+name: 'babofet'
+root_dir: /home/florian/Documents/Dataset/new_babofet/
+# Independent labeled database used for the supervised anti-collapse anchor.
+pretrain_json: data_train.json
+# Longitudinal sequence optimized by segmentation-registration consistency.
+sequence_json: data_val.json
+label_metadata: labels_metadata.json
+gi_normalized: null
+t0: 92
+tn: 155
+num_classes: 4
+date_format: null
+csize: [ 192, 224, 128 ]
+rsize: [ 192, 224, 128  ]

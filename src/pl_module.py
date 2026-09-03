@@ -234,13 +234,13 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
 
         num_timepoints = images.shape[0]
         self.log(
-            "train/seg_loss", total_loss_sum / num_timepoints,
+            "train/segmentation/loss", total_loss_sum / num_timepoints,
             on_step=False, on_epoch=True, prog_bar=True,
         )
         self.log_dict(
             {
-                "diagnostics/temporal_loss": temporal_loss_sum / num_timepoints,
-                "diagnostics/supervised_loss": supervised_loss_sum / num_timepoints,
+                "train/segmentation/temporal_loss": temporal_loss_sum / num_timepoints,
+                "train/segmentation/supervised_loss": supervised_loss_sum / num_timepoints,
             },
             on_step=False, on_epoch=True, prog_bar=False,
         )
@@ -317,7 +317,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
 
         number_of_timepoints = images.shape[0]
         self.log(
-            "train/seg_loss",
+            "train/segmentation/loss",
             total_loss_sum / number_of_timepoints,
             on_step=False,
             on_epoch=True,
@@ -325,10 +325,10 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         )
         self.log_dict(
             {
-                "diagnostics/t0_transport_loss": (
+                "train/segmentation/t0_transport_loss": (
                     transported_loss_sum / number_of_timepoints
                 ),
-                "diagnostics/supervised_loss": (
+                "train/segmentation/supervised_loss": (
                     supervised_loss_sum / number_of_timepoints
                 ),
             },
@@ -485,11 +485,16 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         optimizer.step()  # type: ignore
 
         self.log(
-            "train/reg_loss", loss.detach(),
+            "train/registration/loss", loss.detach(),
             on_step=False, on_epoch=True, prog_bar=True,
         )
         self.log_dict(
-            {f"Registration/{name}": value for name, value in components.items()},
+            {
+                "train/registration/loss_similarity": components["loss_sim"],
+                "train/registration/loss_segmentation": components["loss_seg"],
+                "train/registration/loss_smoothness": components["loss_grad"],
+                "train/registration/loss_jacobian": components["loss_jac"],
+            },
             on_step=False, on_epoch=True, prog_bar=False,
         )
         torch.cuda.empty_cache()
@@ -528,7 +533,6 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
     def on_validation_epoch_start(self) -> None:
         self.seg_metrics_seg.reset()
         self.scores = {}
-        self.transform_reversed = self.trainer.val_dataloaders.dataset.get_reverse_transform()
 
     @staticmethod
     def _save_displacement_nifti(flow_ras_mm, affine, output_path):
@@ -553,8 +557,8 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
                 preds_seg = self.segmentation(images[idx:idx + 1].float())
                 preds_seg = torch.argmax(preds_seg, dim=1)
                 seg_i = F.one_hot(segs[idx].long(), num_classes=self.num_classes).permute(0, 4, 1, 2, 3).float()
-                self.transform_reversed(tio.LabelMap(tensor=model_labels_to_raw(preds_seg).cpu())).save(os.path.join(self.save_dir, "segmentations", f"pred_seg_sample{batch_idx}_time{idx}.nii.gz"))
-                self.transform_reversed(tio.LabelMap(tensor=((segs[idx] != preds_seg)*1.0).cpu())).save(os.path.join(self.save_dir, "segmentations_errormaps", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
+                tio.LabelMap(tensor=model_labels_to_raw(preds_seg).cpu()).save(os.path.join(self.save_dir, "segmentations", f"pred_seg_sample{batch_idx}_time{idx}.nii.gz"))
+                tio.LabelMap(tensor=((segs[idx] != preds_seg)*1.0).cpu()).save(os.path.join(self.save_dir, "segmentations_errormaps", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
                 preds_seg = F.one_hot(preds_seg, num_classes=self.num_classes).permute(0, 4, 1, 2, 3).float()
                 self.seg_metrics_seg(preds_seg.cpu(), seg_i.cpu())
                 subject_scores.append(self.seg_metrics_seg.get_buffer()[-1].numpy().tolist())
@@ -578,15 +582,15 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         all_phi = all_phi.detach()
         for idx in range(0, images.shape[0]):
             original_session = self.trainer.val_dataloaders.dataset.get_subject(batch_idx, idx)
-            processed_session = self.trainer.val_dataloaders.dataset.transform(original_session)
-            model_affine = processed_session.image.affine
+
+            model_affine = original_session.image.affine
             phi = all_phi[idx]
             df = phi - grid_voxel
             warped = registration.warp(images[0:1].float(), df)
             warped_seg = registration.warp(initial_seg.to(self.device).float(), df)
             warped_seg = torch.argmax(warped_seg, dim=1).detach()
-            self.transform_reversed(tio.LabelMap(tensor=model_labels_to_raw(warped_seg).cpu())).save(os.path.join(self.save_dir, "registration_parcellations", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
-            self.transform_reversed(tio.ScalarImage(tensor=warped.squeeze(0).cpu())).save(os.path.join(self.save_dir, "registration_images", f"image_sample{batch_idx}_time{idx}.nii.gz"))
+            tio.LabelMap(tensor=model_labels_to_raw(warped_seg).cpu()).save(os.path.join(self.save_dir, "registration_parcellations", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
+            tio.ScalarImage(tensor=warped.squeeze(0).cpu()).save(os.path.join(self.save_dir, "registration_images", f"image_sample{batch_idx}_time{idx}.nii.gz"))
             # The network predicts voxel-axis increments. Convert them to RAS-mm
             # vectors and preserve the model grid affine; do not treat a vector
             # field as three scalar channels during the reverse transform.
@@ -638,7 +642,13 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         mean_dice_seg = self.seg_metrics_seg.aggregate().item()
         self.seg_metrics_seg.reset()
         self.seg_metrics_reg.reset()
-        self.log("val/seg_dice", mean_dice_seg, on_step=False, on_epoch=True, prog_bar=True)
+        self.log(
+            "validation/segmentation/dice",
+            mean_dice_seg,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+        )
         torch.cuda.empty_cache()
         if self.max_dice_score < mean_dice_seg:
             self.max_dice_score = mean_dice_seg
@@ -671,8 +681,20 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
 
         mean_dice = float(np.mean(dice_vals)) if dice_vals else 0.0
         mean_jac_neg = float(np.mean(jac_vals)) if jac_vals else 0.0
-        self.log("val/reg_dice", mean_dice, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/negative_jacobians", mean_jac_neg, on_step=False, on_epoch=True, prog_bar=False)
+        self.log(
+            "validation/registration/dice",
+            mean_dice,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+        )
+        self.log(
+            "validation/registration/negative_jacobians",
+            mean_jac_neg,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+        )
  
         # Reset
         self.table_result_data = []
