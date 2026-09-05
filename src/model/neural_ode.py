@@ -113,20 +113,22 @@ class LongitudinalODERegistration(nn.Module):
             Cumulative regularisation loss accumulated up to the final
             time step (scalar).
         """
-        duration = ages_target - ages[0]
-        if torch.any(duration == 0):
-            raise ValueError("ages_target must be different from ages[0]")
-        relative_ages = (ages - ages[0]) / duration
-        source_age_normalized = ages[0]
+        if ages.ndim != 1 or ages.numel() < 2:
+            raise ValueError("ages must contain at least two time points")
+        age_differences = ages[1:] - ages[:-1]
+        if not (torch.all(age_differences > 0) or torch.all(age_differences < 0)):
+            raise ValueError("ages must be strictly monotonic")
+        if not torch.allclose(ages_target, ages[-1]):
+            raise ValueError("ages_target must be the last sequence age")
         ode_func = ODEFunction(
             self.velocity_net,
             imageA,
             imageB,
             identity_grid=grid,
             loss_jac=self.jacobian_loss,
+            source_age=ages[0],
+            target_age=ages_target,
             loss_v=loss_v,
-            source_age_normalized=source_age_normalized,
-            duration_normalized=duration,
         )
         zero = imageA.new_zeros(())
         phi_traj, loss_reg_traj, loss_jac_traj = odeint(
@@ -136,7 +138,7 @@ class LongitudinalODERegistration(nn.Module):
                 zero,
                 zero.clone(),
             ),  # initial state: (phi₀, loss_reg₀, loss_jac₀)
-            relative_ages,
+            ages,
             method="rk4",
             options={"step_size": self.step_time},
         )
@@ -179,8 +181,8 @@ class ODEFunction(nn.Module):
         imageB: torch.Tensor,
         identity_grid: torch.Tensor,
         loss_jac: nn.Module,
-        source_age_normalized: torch.Tensor,
-        duration_normalized: torch.Tensor,
+        source_age: torch.Tensor,
+        target_age: torch.Tensor,
         loss_v: nn.Module = monai.losses.DiffusionLoss(normalize=True), # type: ignore
     ) -> None:
         super().__init__()
@@ -190,8 +192,8 @@ class ODEFunction(nn.Module):
         self.identity_grid = identity_grid
         self.loss_v = loss_v
         self.loss_jac = loss_jac
-        self.source_age_normalized = source_age_normalized
-        self.duration_normalized = duration_normalized
+        self.source_age = source_age
+        self.target_age = target_age
 
     def forward(
         self,
@@ -219,24 +221,20 @@ class ODEFunction(nn.Module):
             accumulated into the state for later retrieval.
         """
         phi_t = state[0]
-        current_age_normalized = (
-            self.source_age_normalized + t * self.duration_normalized
-        )
         v = self.vnet(
+            self.source_age,
             t,
-            current_age_normalized,
-            self.duration_normalized,
+            self.target_age,
             phi_t,
             self.imageA,
             self.imageB,
         )
         loss_v: torch.Tensor = self.loss_v(v)
         shape = phi_t.shape[2:]
-        scale = phi_t.new_tensor(shape).view(1, 3, 1, 1, 1)
+        scale = (phi_t.new_tensor(shape) - 1).view(1, 3, 1, 1, 1)
         displacement_voxel = (phi_t - self.identity_grid) * scale / 2.0
         loss_jac: torch.Tensor = self.loss_jac(displacement_voxel)
-        absolute_duration = torch.abs(self.duration_normalized)
-        return v, loss_v * absolute_duration, loss_jac * absolute_duration
+        return v, loss_v, loss_jac
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -251,10 +249,9 @@ class VelocityNet(nn.Module):
     *imageB* — into a 3-channel input and processes it through a symmetric
     encoder–decoder with skip connections.
 
-    Temporal information is encoded by mapping the tuple
-    ``(t_normalised, tA, tB)`` through sinusoidal position embeddings and
-    a 3-layer SiLU MLP, producing a time embedding vector that is injected
-    into every encoder and decoder block via feature-wise modulation.
+    The absolute normalized ages ``(t_A, t, t_B)`` are mapped through
+    sinusoidal position embeddings and a 3-layer SiLU MLP, then injected into
+    every encoder and decoder block via feature-wise modulation.
 
     Parameters
     ----------
@@ -277,7 +274,11 @@ class VelocityNet(nn.Module):
     ) -> None:
         super().__init__()
         self.shape = shape
-        self.grid = registration.generate_grid3d_tensor(self.shape).cuda()
+        self.register_buffer(
+            "grid",
+            registration.generate_grid3d_tensor(self.shape),
+            persistent=False,
+        )
         self.t_dim_enc = t_dim_enc
         self.t_dim = t_dim
         self.encoder = EncoderUnet(
@@ -299,7 +300,7 @@ class VelocityNet(nn.Module):
             self.t_dim_enc, max_periods=100
         )
         self.time_mlp = nn.Sequential(
-            nn.Linear(self.t_dim_enc * 3, self.t_dim, bias=True),
+            nn.Linear(3 * self.t_dim_enc, self.t_dim, bias=True),
             nn.SiLU(),
             nn.Linear(self.t_dim, self.t_dim, bias=True),
             nn.SiLU(),
@@ -315,24 +316,26 @@ class VelocityNet(nn.Module):
 
     def forward(
         self,
+        t_a: torch.Tensor,
         t: torch.Tensor,
-        absolute_age: torch.Tensor,
-        duration: torch.Tensor,
+        t_b: torch.Tensor,
         phi_t: torch.Tensor,
         image_A: torch.Tensor,
         image_B: torch.Tensor,
     ) -> torch.Tensor:
         """Predict the velocity field at integration time *t*.
 
-        The normalised time ``(t - ageA) / (ageB - ageA)`` is used so the
-        network receives a value in ``[0, 1]`` regardless of the absolute
-        age range, making it easier to learn temporal patterns across
-        different developmental windows.
+        ``t_A``, ``t`` and ``t_B`` are absolute normalized ages supplied by
+        the data loader. They are not renormalized for each sub-sequence.
 
         Parameters
         ----------
         t : torch.Tensor
             Current integration time, broadcastable to ``(B,)``.
+        t_a : torch.Tensor
+            Source age of the directed sub-sequence.
+        t_b : torch.Tensor
+            Target age of the directed sub-sequence.
         phi_t : torch.Tensor
             Current deformation field of shape ``(B, 3, D, H, W)`` in
             normalised ``[-1, 1]`` coordinates.
@@ -340,11 +343,6 @@ class VelocityNet(nn.Module):
             Source image ``(B, 1, H, W, D)``.
         image_B : torch.Tensor
             Target image ``(B, 1, H, W, D)``.
-        ageA : torch.Tensor
-            Start age of the integration interval, broadcastable to ``(B,)``.
-        ageB : torch.Tensor
-            End age of the integration interval, broadcastable to ``(B,)``.
-
         Returns
         -------
         v : torch.Tensor
@@ -355,18 +353,14 @@ class VelocityNet(nn.Module):
         net_input = torch.cat([image_A, warped, image_B], dim=1)
         B: int = phi_t.shape[0]
 
+        if t_a.dim() == 0:
+            t_a = t_a.expand(B)
         if t.dim() == 0:
             t = t.expand(B)
-        if absolute_age.dim() == 0:
-            absolute_age = absolute_age.expand(B)
-        if duration.dim() == 0:
-            duration = duration.expand(B)
+        if t_b.dim() == 0:
+            t_b = t_b.expand(B)
         temporal_context = torch.cat(
-            [
-                self.temp_enc(t),
-                self.temp_enc(absolute_age),
-                self.temp_enc(duration),
-            ],
+            [self.temp_enc(t_a), self.temp_enc(t), self.temp_enc(t_b)],
             dim=-1,
         )
         t_all: torch.Tensor = self.time_mlp(temporal_context)
