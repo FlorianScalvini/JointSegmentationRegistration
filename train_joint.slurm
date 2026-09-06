@@ -36,9 +36,10 @@ srun python -u src/train.py \
     --lambda_reg "$lambda_reg" \
     --lambda_jac "$lambda_jac" \
     --lambda_seg 1 \
-    --lambda_sim 0.0005 \
+    --lambda_sim 0.0000 \
     --lambda_anchor 1.0 \
     --pretrain_registration_epochs "$pretrain_registration_epochs" \
     --segmentation_method "$segmentation_method" \
     --max_epochs 5000 \
+    --num_workers 0 \
     --check_val_every_n_epoch 5

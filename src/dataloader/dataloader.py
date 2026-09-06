@@ -182,9 +182,9 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         return torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=1,
-            num_workers=1,             # ← Single worker
+            num_workers=self.num_workers,
             shuffle=True,
-            prefetch_factor=1,         # ← Only 1 batch ahead (your current setting)
+            prefetch_factor=1 if self.num_workers > 0 else None,
             pin_memory=True,
             persistent_workers=False,
             drop_last=False,
@@ -196,9 +196,9 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         return torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=1,
-            num_workers=1,             # ← Single worker
+            num_workers=self.num_workers,
             shuffle=False,
-            prefetch_factor=1,         # ← Only 1 batch ahead (your current setting)
+            prefetch_factor=1 if self.num_workers > 0 else None,
             pin_memory=False,
             persistent_workers=False,
             drop_last=False,
@@ -210,9 +210,9 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         return torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=1,
-            num_workers=1,             # ← Single worker
+            num_workers=self.num_workers,
             shuffle=False,
-            prefetch_factor=1,         # ← Only 1 batch ahead (your current setting)
+            prefetch_factor=1 if self.num_workers > 0 else None,
             pin_memory=False,
             persistent_workers=False,
             drop_last=False,
