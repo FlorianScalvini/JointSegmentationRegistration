@@ -142,7 +142,14 @@ class LongitudinalODERegistration(nn.Module):
             method="rk4",
             options={"step_size": self.step_time},
         )
-        return phi_traj, loss_reg_traj[-1], loss_jac_traj[-1]
+        # Integrate penalties over elapsed time: decreasing ages otherwise
+        # turn positive regularizers into rewards for irregular deformations.
+        time_direction = torch.sign(ages[-1] - ages[0])
+        return (
+            phi_traj,
+            time_direction * loss_reg_traj[-1],
+            time_direction * loss_jac_traj[-1],
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
