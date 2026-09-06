@@ -50,5 +50,5 @@ def normalize_to_0_1(volume):
     '''
     max_val = volume.max()
     min_val = volume.min()
-    return (volume - min_val) / (max_val - min_val)
-
+    span = max_val - min_val
+    return (volume - min_val) / torch.where(span > 0, span, torch.ones_like(span))

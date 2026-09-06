@@ -77,7 +77,8 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         self.pretrain_registration_epochs = pretrain_registration_epochs
         # Logging and tracking best performance
         self.save_dir = save_dir
-        self.max_dice_score = 0
+        self.max_dice_score = float('-inf')
+        self.max_registration_dice_score = float('-inf')
         self.val_grid_images = []
         self.table_result_data = []
         self.registration_weight_loss = weight
@@ -116,6 +117,8 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
 
     def on_load_checkpoint(self, checkpoint) -> None:
         """Allow older checkpoints without EMA weights to remain loadable."""
+        self.max_dice_score = checkpoint.get("best_segmentation_dice", float('-inf'))
+        self.max_registration_dice_score = checkpoint.get("best_registration_dice", float('-inf'))
         state_dict = checkpoint.get("state_dict", {})
         ema_prefix = "segmentation_ema."
         if not any(key.startswith(ema_prefix) for key in state_dict):
@@ -125,14 +128,18 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
                     state_dict[ema_prefix + key[len(student_prefix):]] = value.clone()
 
 
+    def on_save_checkpoint(self, checkpoint) -> None:
+        checkpoint["best_segmentation_dice"] = self.max_dice_score
+        checkpoint["best_registration_dice"] = self.max_registration_dice_score
+
     def forward(self, x):
-        return NotImplementedError("Forward pass is integrated into the training step for joint optimization.") 
+        raise NotImplementedError("Forward pass is integrated into the training step for joint optimization.")
 
     
     def forward_registration(self, initial_img, target_img, target_age, ages, grid):
         shape = initial_img.shape[2:]
         # align_corners=True maps [-1, 1] exactly onto voxel indices [0, N-1].
-        scale_factor = (torch.tensor(shape, device=self.device, dtype=grid.dtype)).view(1, 3, 1, 1, 1)
+        scale_factor = (torch.tensor(shape, device=self.device, dtype=grid.dtype) - 1).view(1, 3, 1, 1, 1)
         all_phi, loss_reg, loss_jac = self.registration(
             initial_img, target_img, ages, target_age, grid
         )
@@ -146,7 +153,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         images, _, ages, pretrain_mri, pretrain_seg, *_ = batch
         shape = images[0].shape[2:]
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
-        voxel_scale = (torch.tensor(shape, device=self.device, dtype=grid.dtype) ).view(1, 3, 1, 1, 1)
+        voxel_scale = (torch.tensor(shape, device=self.device, dtype=grid.dtype) - 1).view(1, 3, 1, 1, 1)
         grid_voxel = (grid + 1.) / 2. * voxel_scale
 
         images = images.squeeze(0)
@@ -256,7 +263,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         shape = images.shape[2:]
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
         voxel_scale = (
-            torch.tensor(shape, device=self.device, dtype=grid.dtype) 
+            torch.tensor(shape, device=self.device, dtype=grid.dtype) - 1
         ).view(1, 3, 1, 1, 1)
         grid_voxel = (grid + 1.0) / 2.0 * voxel_scale
 
@@ -402,7 +409,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         shape = images[0].shape[2:]
         # Must match the scale used in forward_registration (shape - 1, align_corners=True)
         scale_factor = (
-            torch.tensor(shape, device=self.device, dtype=torch.float32) * 1.0
+            torch.tensor(shape, device=self.device, dtype=torch.float32) - 1
         ).view(1, 3, 1, 1, 1)
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
 
@@ -461,17 +468,9 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
                     grid,
                     scale_factor,
                 )
+                if not torch.isfinite(trajectory_loss):
+                    raise FloatingPointError(f"Non-finite registration loss at batch {batch_idx}, trajectory {i} {direction}")
                 self.manual_backward(trajectory_loss / num_trajectories)
-                # Clip after each adjoint backward pass so that an unstable
-                # trajectory cannot contaminate all subsequent accumulated
-                # gradients. ``error_if_nonfinite`` identifies the first
-                # trajectory producing NaN/Inf gradients.
-                torch.nn.utils.clip_grad_norm_(
-                    self.registration.parameters(),
-                    max_norm=0.5,
-                    norm_type=2.0,
-                    error_if_nonfinite=True,
-                )
                 loss_sum += trajectory_loss.detach()
                 for name, value in trajectory_components.items():
                     component_sums[name] += value
@@ -482,6 +481,11 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
             for name, value in component_sums.items()
         }
 
+        # Clip the complete average gradient, after Lightning unscales it.
+        self.clip_gradients(optimizer, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
+        if any(p.grad is not None and not torch.isfinite(p.grad).all()
+               for p in self.registration.parameters()):
+            raise FloatingPointError(f"Non-finite registration gradient at batch {batch_idx}")
         optimizer.step()  # type: ignore
 
         self.log(
@@ -554,17 +558,18 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
 
         with torch.no_grad():
             for idx in range(images.shape[0]):
+                affine = self.trainer.val_dataloaders.dataset.get_subject(batch_idx, idx).image.affine
                 preds_seg = self.segmentation(images[idx:idx + 1].float())
                 preds_seg = torch.argmax(preds_seg, dim=1)
                 seg_i = F.one_hot(segs[idx].long(), num_classes=self.num_classes).permute(0, 4, 1, 2, 3).float()
-                tio.LabelMap(tensor=model_labels_to_raw(preds_seg).cpu()).save(os.path.join(self.save_dir, "segmentations", f"pred_seg_sample{batch_idx}_time{idx}.nii.gz"))
-                tio.LabelMap(tensor=((segs[idx] != preds_seg)*1.0).cpu()).save(os.path.join(self.save_dir, "segmentations_errormaps", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
+                tio.LabelMap(tensor=model_labels_to_raw(preds_seg).cpu(), affine=affine).save(os.path.join(self.save_dir, "segmentations", f"pred_seg_sample{batch_idx}_time{idx}.nii.gz"))
+                tio.LabelMap(tensor=((segs[idx] != preds_seg)*1.0).cpu(), affine=affine).save(os.path.join(self.save_dir, "segmentations_errormaps", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
                 preds_seg = F.one_hot(preds_seg, num_classes=self.num_classes).permute(0, 4, 1, 2, 3).float()
                 self.seg_metrics_seg(preds_seg.cpu(), seg_i.cpu())
                 subject_scores.append(self.seg_metrics_seg.get_buffer()[-1].numpy().tolist())
         self.scores[batch_idx] = subject_scores
         shape = images.shape[2:]
-        scale_factor = (torch.tensor(shape, device=self.device, dtype=torch.float32)).view(1, 3, 1, 1, 1)
+        scale_factor = (torch.tensor(shape, device=self.device, dtype=torch.float32) - 1).view(1, 3, 1, 1, 1)
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
     
         grid_voxel = (grid + 1.) / 2. * scale_factor
@@ -589,8 +594,8 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
             warped = registration.warp(images[0:1].float(), df)
             warped_seg = registration.warp(initial_seg.to(self.device).float(), df)
             warped_seg = torch.argmax(warped_seg, dim=1).detach()
-            tio.LabelMap(tensor=model_labels_to_raw(warped_seg).cpu()).save(os.path.join(self.save_dir, "registration_parcellations", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
-            tio.ScalarImage(tensor=warped.squeeze(0).cpu()).save(os.path.join(self.save_dir, "registration_images", f"image_sample{batch_idx}_time{idx}.nii.gz"))
+            tio.LabelMap(tensor=model_labels_to_raw(warped_seg).cpu(), affine=model_affine).save(os.path.join(self.save_dir, "registration_parcellations", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
+            tio.ScalarImage(tensor=warped.squeeze(0).cpu(), affine=model_affine).save(os.path.join(self.save_dir, "registration_images", f"image_sample{batch_idx}_time{idx}.nii.gz"))
             # The network predicts voxel-axis increments. Convert them to RAS-mm
             # vectors and preserve the model grid affine; do not treat a vector
             # field as three scalar channels during the reverse transform.
@@ -621,7 +626,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
                 det_jac = utils.compute_jacobian_determinant_3d(df.cpu()).numpy()
                 nb_jac_neg = int(np.sum(det_jac < 0))
                 buffer = self.seg_metrics_reg.get_buffer()
-                dice = float(buffer[-1].mean().item())
+                dice = float(buffer[-1].nanmean().item())
                 results = [str(batch_idx) + "_" + str(idx), grid_img, dice, nb_jac_neg]
                 self.table_result_data.append(results)
             del warped, warped_seg, phi, xy, pred_label
@@ -640,6 +645,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
     def on_validation_epoch_end(self) -> None:
         # Compute and log mean Dice score for segmentation
         mean_dice_seg = self.seg_metrics_seg.aggregate().item()
+        mean_dice = self.seg_metrics_reg.aggregate().item()
         self.seg_metrics_seg.reset()
         self.seg_metrics_reg.reset()
         self.log(
@@ -650,10 +656,12 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
             prog_bar=True,
         )
         torch.cuda.empty_cache()
-        if self.max_dice_score < mean_dice_seg:
+        if not self.trainer.sanity_checking and np.isfinite(mean_dice_seg) and self.max_dice_score < mean_dice_seg:
             self.max_dice_score = mean_dice_seg
-            torch.save(self.registration.state_dict(), os.path.join(self.save_dir, "best_registration.pt"))
             torch.save(self.segmentation.state_dict(), os.path.join(self.save_dir, "best_segmentation.pt"))
+        if not self.trainer.sanity_checking and np.isfinite(mean_dice) and self.max_registration_dice_score < mean_dice:
+            self.max_registration_dice_score = mean_dice
+            torch.save(self.registration.state_dict(), os.path.join(self.save_dir, "best_registration.pt"))
         json.dump(self.scores, open(os.path.join(self.save_dir, "dice_scores.json"), "w"))
         if self.current_epoch == 0:
             json.dump(self.scores, open(os.path.join(self.save_dir, "pretrain_results.json"), "w"))
@@ -669,7 +677,6 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
 
         # Log grid images + scalars as a combined image panel
         grid_imgs = [row[1] for row in self.table_result_data]  # tensors (3,H,W)
-        dice_vals = [row[2] for row in self.table_result_data]
         jac_vals = [row[3] for row in self.table_result_data]
 
         if grid_imgs:
@@ -679,7 +686,6 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
                 os.path.join(self.save_dir, "latest_deformation_grids.png"),
             )
 
-        mean_dice = float(np.mean(dice_vals)) if dice_vals else 0.0
         mean_jac_neg = float(np.mean(jac_vals)) if jac_vals else 0.0
         self.log(
             "validation/registration/dice",
