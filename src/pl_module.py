@@ -31,7 +31,7 @@ def model_labels_to_raw(labels):
 
 
 class PLJointRegistrationSegmentation(pl.LightningModule):
-    def __init__(self, num_classes, learning_rate=0.01, save_dir="", lambda_seg=1, lambda_reg=0.001, lambda_sim=0.0, lambda_jac:float = 0.000001, lambda_anchor:float = 1, ema_decay:float = 0.99, pretrain_registration_epochs:int = 0, segmentation_method:str = "temporal_neighbors", t0: float = 0.0, tn: float = 1.0, shape=[192, 224, 192], step_time=0.1, weight=False, *args, **kwargs):
+    def __init__(self, num_classes, learning_rate=1e-4, save_dir="", lambda_seg=1, lambda_reg=0.001, lambda_sim=0.0, lambda_jac:float = 0.000001, lambda_anchor:float = 1, ema_decay:float = 0.99, pretrain_registration_epochs:int = 0, segmentation_method:str = "temporal_neighbors", t0: float = 0.0, tn: float = 1.0, shape=[192, 224, 192], step_time=0.1, weight=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.save_hyperparameters()
         self.learning_rate = learning_rate
@@ -89,8 +89,8 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
 
 
     def configure_optimizers(self):
-        opt_registration = torch.optim.Adam(self.registration.parameters(), lr=0.0001)
-        opt_segmentation = torch.optim.Adam(self.segmentation.parameters(), lr=0.0001)
+        opt_registration = torch.optim.Adam(self.registration.parameters(), lr=self.learning_rate)
+        opt_segmentation = torch.optim.Adam(self.segmentation.parameters(), lr=self.learning_rate)
         return [opt_registration, opt_segmentation]
 
     @torch.no_grad()
@@ -132,7 +132,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
     def forward_registration(self, initial_img, target_img, target_age, ages, grid):
         shape = initial_img.shape[2:]
         # align_corners=True maps [-1, 1] exactly onto voxel indices [0, N-1].
-        scale_factor = (torch.tensor(shape, device=self.device, dtype=grid.dtype) - 1).view(1, 3, 1, 1, 1)
+        scale_factor = (torch.tensor(shape, device=self.device, dtype=grid.dtype)).view(1, 3, 1, 1, 1)
         all_phi, loss_reg, loss_jac = self.registration(
             initial_img, target_img, ages, target_age, grid
         )
@@ -146,7 +146,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         images, _, ages, pretrain_mri, pretrain_seg, *_ = batch
         shape = images[0].shape[2:]
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
-        voxel_scale = (torch.tensor(shape, device=self.device, dtype=grid.dtype) - 1).view(1, 3, 1, 1, 1)
+        voxel_scale = (torch.tensor(shape, device=self.device, dtype=grid.dtype) ).view(1, 3, 1, 1, 1)
         grid_voxel = (grid + 1.) / 2. * voxel_scale
 
         images = images.squeeze(0)
@@ -256,7 +256,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         shape = images.shape[2:]
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
         voxel_scale = (
-            torch.tensor(shape, device=self.device, dtype=grid.dtype) - 1
+            torch.tensor(shape, device=self.device, dtype=grid.dtype) 
         ).view(1, 3, 1, 1, 1)
         grid_voxel = (grid + 1.0) / 2.0 * voxel_scale
 
@@ -402,7 +402,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
         shape = images[0].shape[2:]
         # Must match the scale used in forward_registration (shape - 1, align_corners=True)
         scale_factor = (
-            torch.tensor(shape, device=self.device, dtype=torch.float32) - 1
+            torch.tensor(shape, device=self.device, dtype=torch.float32) * 1.0
         ).view(1, 3, 1, 1, 1)
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
 
@@ -564,7 +564,7 @@ class PLJointRegistrationSegmentation(pl.LightningModule):
                 subject_scores.append(self.seg_metrics_seg.get_buffer()[-1].numpy().tolist())
         self.scores[batch_idx] = subject_scores
         shape = images.shape[2:]
-        scale_factor = (torch.tensor(shape, device=self.device, dtype=torch.float32) - 1).view(1, 3, 1, 1, 1)
+        scale_factor = (torch.tensor(shape, device=self.device, dtype=torch.float32)).view(1, 3, 1, 1, 1)
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
     
         grid_voxel = (grid + 1.) / 2. * scale_factor

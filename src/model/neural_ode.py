@@ -355,7 +355,8 @@ class VelocityNet(nn.Module):
         v : torch.Tensor
             Predicted velocity field of shape ``(B, 3, D, H, W)``.
         """
-        df = phi_t - self.grid
+        scale = phi_t.new_tensor(image_A.shape[2:]).view(1, 3, 1, 1, 1)
+        df = (phi_t - self.grid) * (scale - 1) / 2
         warped = registration.warp(image_A, df)
         net_input = torch.cat([image_A, warped, image_B], dim=1)
         B: int = phi_t.shape[0]
